@@ -56,6 +56,18 @@ class LayerNorm(nn.Module):
         mean = torch.mean(x, dim=1, keepdim=True)
         return (x - mean) / (var + eps).sqrt() * self.gamma
 
+class WeightStandardizedConv3d(nn.Conv3d):
+    def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
+
+        weight = self.weight
+
+        mean = reduce(weight, 'o ... -> o 1 1 1 1', 'mean')
+        var = reduce(weight, 'o ... -> o 1 1 1 1', partial(torch.var, unbiased = False))
+        weight = (weight - mean) * (var + eps).rsqrt()
+
+        return F.conv3d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
 class Block(nn.Module):
     def __init__(self,
                  dim,
@@ -248,6 +260,39 @@ class FeatureMapConsolidator(nn.Module):
         return dict(kernel_size = kernel_size, padding = paddings)
 
 
+class PixelShuffleUpsample(nn.Module):
+    def __init__(self,
+                 dim,
+                 dim_out=None,
+                 scale_factor=2
+            ):
+        super().__init__()
+        self.scale_squared = scale_factor ** 2
+        dim_out = default(dim_out, dim)
+        conv = nn.Conv3d(dim, dim_out * self.scale_squared, 1)
+
+        self.net = nn.Sequential(conv,
+                                 nn.SiLU(),
+                                 Rearrange('b (c r s) f h w -> b c f (h r) (w s)', r=scale_factor, s=scale_factor)
+                                )
+
+        self.init_conv_(conv)
+
+    def init_conv_(self, conv):
+        o, i ,*rest_dims = conv.weight.shape
+        conv_weight = torch.empty(o // self.scale_squared, i, *rest_dims)
+        nn.init.kaiming_uniform_(conv_weight)
+        conv_weight = repeat(conv_weight, 'o ... -> (o r) ...', r=self.scale_squared)
+
+        conv_weight.data.copy_(conv_weight)
+        nn.init.zeros_(conv.bias.data)
+
+    def forward(self, x):
+        x = self.net(x)
+        return x
+
+
+
 class xunet(nn.Module):
     def __init__(self,
                  dim,
@@ -333,7 +378,175 @@ class xunet(nn.Module):
 
         self.mid = blocks(mid_dim, mid_dim, nested_unet_depth=mid_neted_unet_depth, nested_unet_dim=nested_unet_dim)
         self.mid_attn = Attention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
-        self.mid_after = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
+        self.mid_after = blocks(mid_dim, mid_dim, nested_unet_depth = mid_neted_unet_depth, nested_unet_dim = nested_unet_dim)
 
         self.mid_upsample = Upsample(mid_dim, dims[-2])
+
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(zip(*up_stage_parameters)):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.ups.append(nn.ModuleList([
+                blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
+                nn.ModuleList([blocks(dim_out, dim_out, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim) for _ in range(num_blocks - 1)]),
+                nn.ModuleList([TransformerBlock(dim_out, depth=self_attn_blocks, heads=heads, dim_head=dim_head) for _ in range(self_attn_blocks)]),
+                Upsample(dim_out, dim_in) if not is_last else nn.Identity()
+            ]))
+
+        out_dim = default(out_dim, channels)
+
+        if consolidate_upsample_fmaps:
+            self.consolidator = FeatureMapConsolidator(
+                dim,
+                dim_ins=tuple(map(lambda m: dim * m, dim_mults)),
+                dim_outs=(dim,) * len(dim_mults),
+                conv_block_fn=blocks
+            )
+        else:
+            self.consolidator = FeatureMapConsolidator(dim=dim)
+
+        final_dim_in = self.consolidator.final_dim_out
+
+        self.final_conv = nn.Sequential(
+            blocks(final_dim_in + dim, dim),
+            nn.Conv3d(dim, out_dim, **kernel_and_same_pad(frame_kernel_size, 3, 3))
+        )
+
+    def forward(self, x):
+        is_image = x.ndim == 4
+
+        if is_image:
+            x = rearrange(x, 'b c h w -> b c 1 h w')
+
+        x = self.init_conv(x)
+
+        r = x.clone()
+
+        down_hiddens = []
+
+        up_hiddens = []
+
+        for init_block, blocks, attn_blocks, downsample in self.downs:
+            x = init_block(x)
+
+            for block in blocks:
+                x = block(x)
+
+            for attn_block in attn_blocks:
+                x = attn_block(x)
+
+            down_hiddens.append(x)
+            x = downsample(x)
+
+        x = self.mid(x)
+        x = self.mid_attn(x) + x
+        x = self.mid_after(x)
+
+        up_hiddens.append(x)
+        x = self.mid_upsample(x)
+
+        for init_block, blocks, attn_blocks, upsample in self.ups:
+            x = torch.cat((x, down_hiddens.pop() * self.skip_scale), dim=1)
+
+            x = init_block(x)
+
+            for block in blocks:
+                x = block(x)
+
+            for attn_block in attn_blocks:
+                x = attn_block(x)
+
+            up_hiddens.insert(0, x)
+            x = upsample(x)
+
+        x = self.consolidator(x, up_hiddens)
+
+        x = torch.cat((x, r), dim=1)
+
+        out = self.final_conv(x)
+
+        if is_image:
+            out = rearrange(out, 'b c 1 h w -> b c h w')
+
+        return out
+
+class NestedResidualUnet(nn.Module):
+    def __init__(
+            self,
+            dim,
+            *,
+            depth,
+            M=32,
+            frame_kernel_size=1,
+            add_residual=False,
+            groups=4,
+            skip_scale=2**-0.5,
+            weight_standardize=False
+            ):
+        super().__init__()
+
+        self.depth = depth
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+
+        conv = WeightStandardizedConv3d if weight_standardize else nn.Conv3d
+
+        for ind in range(depth):
+            is_first = ind = 0
+            dim_in = dim if is_first else M
+
+            down = nn.Sequential(
+                conv(dim_in, M, (1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)),
+                nn.GroupNorm(groups, M),
+                nn.SiLU()
+            )
+
+            up = nn.Sequential(
+                PixelShuffleUpsample(2 * M, dim_in),
+                nn.GroupNorm(groups, dim_in),
+                nn.SiLU()
+            )
+
+            self.downs.append(down)
+            self.ups.append(up)
+
+        self.mid = nn.Sequential(
+            conv(M, M, **kernel_and_same_pad(frame_kernel_size, 3, 3)),
+            nn.GroupNorm(groups, M),
+            nn.SiLU()
+        )
+
+        self.skip_scale = skip_scale
+        self.add_residual = add_residual
+
+    def forward(self, x, residual = None):
+        is_video = x.ndim == 5
+
+        if self.add_residual:
+            residual = default(residual, x.clone())
+
+        *_, h, w = x.shape
+
+        layers = len(self.ups)
+
+        hiddens = []
+
+        for down in self.downs:
+            x = down(x)
+            hiddens.append(x.clone().contiguous())
+
+        x = self.mid(x)
+
+        for up in reversed(self.ups):
+            x = torch.cat((x, hiddens.pop() * self.skip_scale), dim = 1)
+            x = up(x)
+
+        if self.add_residual:
+            x = x + residual
+            x = F.silu(x)
+
+        return x
+
+
+
+
 
